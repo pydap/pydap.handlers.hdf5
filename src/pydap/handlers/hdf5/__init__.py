@@ -4,101 +4,74 @@ import time
 from stat import ST_MTIME
 from email.utils import formatdate
 
-import numpy
-import h5py
+import numpy as np
 
-from arrayterator import Arrayterator
+import h5py
 
 from pydap.model import *
 from pydap.handlers.lib import BaseHandler
 from pydap.exceptions import OpenFileError
-from pydap.lib import quote
 
 
-class Handler(BaseHandler):
+class HDF5Handler(BaseHandler):
 
     extensions = re.compile(r"^.*\.(h5|hdf5)$", re.IGNORECASE)
 
     def __init__(self, filepath):
-        self.filepath = filepath
-
-    def parse_constraints(self, environ):
-        buf_size = int(environ.get('pydap.handlers.netcdf.buf_size', 10000))
+        BaseHandler.__init__(self)
 
         try:
-            fp = h5py.File(self.filepath, 'r')
-        except:
-            message = 'Unable to open file %s.' % self.filepath
+            self.fp = h5py.File(filepath, 'r')
+        except Exception, exc:
+            message = 'Unable to open file %s: %s' % (filepath, exc)
             raise OpenFileError(message)
 
-        last_modified = formatdate( time.mktime( time.localtime( os.stat(self.filepath)[ST_MTIME] ) ) )
-        environ['pydap.headers'].append( ('Last-modified', last_modified) )
+        self.additional_headers.append(
+            ('Last-modified', (formatdate(time.mktime(time.localtime( os.stat(
+                filepath)[ST_MTIME]))))))
 
-        dataset = DatasetType(name=os.path.split(self.filepath)[1],
-                attributes={'NC_GLOBAL': dict(fp.attrs)})
+        # build dataset
+        name = os.path.split(filepath)[1]
+        self.dataset = DatasetType(name, attributes={
+            "NC_GLOBAL": dict(self.fp.attrs),
+        })
 
-        fields, queries = environ['pydap.ce']
-        fields = fields or [[(name, ())] for name in fp.keys()]
-        for var in fields:
-            get_child(fp, dataset, var, buf_size)
+        if self.fp.attrs.get('Map Projection') == 'Equidistant Cylindrical':
+            lat_bnds = np.linspace(
+                self.fp.attrs['Northernmost Latitude'],
+                self.fp.attrs['Southernmost Latitude'],
+                self.fp.attrs['Number of Lines']+1)
+            lat = (lat_bnds[:-1] + lat_bnds[1:])/2.
+            lon_bnds = np.linspace(
+                self.fp.attrs['Westernmost Longitude'],
+                self.fp.attrs['Easternmost Longitude'],
+                self.fp.attrs['Number of Columns']+1)
+            lon = (lon_bnds[:-1] + lon_bnds[1:])/2.
+            dims = lat, lon
+        else:
+            dims = None
 
-        dataset._set_id()
-        dataset.close = fp.close
-        return dataset
-
-
-def get_child(source, target, var, buf_size):
-    for name, slice_ in var:
-        if name not in source or name.startswith('_i_'):  # hide pytables indexes
-            break
-
-        if isinstance(source[name], (h5py.Dataset, numpy.ndarray)):
-            dtype = source[name].dtype
-            if len(dtype):
-                # array has composite dtype, we need to transform it in a Structure
-                attrs = dict(getattr(source[name], 'attrs', {}))
-                target.setdefault(name, StructureType(name=name, attributes=attrs))
-                target = target[name]
-                data = source[name]
-                source = {}
-                for child in dtype.names:
-                    source[child] = data[child]
+        for name in self.fp:
+            if dims and self.fp[name].shape == (len(lat), len(lon)):
+                g = self.dataset[name] = GridType(name, dict(self.fp[name].attrs))
+                g[name] = BaseType(name, self.fp[name], ('lat', 'lon'),
+                    dict(self.fp[name].attrs))
+                g['lat'] = BaseType('lat', dims[0], None,
+                    dict(axis='Y', units='degrees_north'))
+                g['lon'] = BaseType('lon', dims[1], None,
+                    dict(axis='X', units='degrees_east'))
             else:
-                # regular array, return data and exit
-                target[quote(name)] = get_var(name, source, slice_, buf_size)
-                break
-        elif name in source and isinstance(source[name], h5py.Group):
-            # group, return Structure
-            attrs = dict(source[name].attrs)
-            target.setdefault(name, StructureType(name=name, attributes=attrs))
-            target = target[name]
-            source = source[name]
-    else:
-        # when a group is requested by itself, return with all children
-        for name in source.keys():
-            get_child(source, target, [(name, ())], buf_size)
+                self.dataset[name] = BaseType(name, self.fp[name], None,
+                    dict(self.fp[name].attrs))
+
+        if dims:
+            self.dataset['lat'] = g['lat']
+            self.dataset['lon'] = g['lon']
 
 
-def get_var(name, source, slice_, buf_size=10000):
-    var = source[name]
-    if var.dtype == numpy.complex:
-        data = var = numpy.dstack((var.real, var.imag))
-    elif var.shape:
-        data = Arrayterator(var, buf_size)[slice_]
-    else:
-        data = numpy.array(var.value)
-    typecode = var.dtype.char
-    attrs = dict(getattr(source[name], 'attrs', {}))
-    if hasattr(var, 'fillvalue'):
-        attrs['_FillValue'] = var.fillvalue
-
-    return BaseType(name=name, data=data, shape=data.shape,
-            type=typecode, attributes=attrs)
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     import sys
-    from paste.httpserver import serve
+    from werkzeug.serving import run_simple
 
-    application = Handler(sys.argv[1])
-    serve(application, port=8001)
+    application = HDF5Handler(sys.argv[1])
+    run_simple('localhost', 8001, application, use_reloader=True)
