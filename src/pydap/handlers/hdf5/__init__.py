@@ -1,3 +1,5 @@
+"""Pydap handler for HDF5 files using h5py."""
+
 import os
 import re
 import time
@@ -5,8 +7,8 @@ from stat import ST_MTIME
 from email.utils import formatdate
 
 import numpy as np
-
 import h5py
+from pkg_resources import get_distribution
 
 from pydap.model import *
 from pydap.handlers.lib import BaseHandler
@@ -15,6 +17,9 @@ from pydap.exceptions import OpenFileError
 
 class HDF5Handler(BaseHandler):
 
+    """A simple handler for HDF5 files based on h5py."""
+
+    __version__ = get_distribution("pydap.handlers.hdf5").version
     extensions = re.compile(r"^.*\.(h5|hdf5)$", re.IGNORECASE)
 
     def __init__(self, filepath):
@@ -27,46 +32,56 @@ class HDF5Handler(BaseHandler):
             raise OpenFileError(message)
 
         self.additional_headers.append(
-            ('Last-modified', (formatdate(time.mktime(time.localtime( os.stat(
-                filepath)[ST_MTIME]))))))
+            ('Last-modified', (
+                formatdate(
+                    time.mktime(
+                        time.localtime(os.stat(filepath)[ST_MTIME]))))))
 
         # build dataset
         name = os.path.split(filepath)[1]
         self.dataset = DatasetType(name, attributes={
             "NC_GLOBAL": dict(self.fp.attrs),
         })
+        build_dataset(self.dataset, self.fp)
 
-        if self.fp.attrs.get('Map Projection') == 'Equidistant Cylindrical':
-            lat_bnds = np.linspace(
-                self.fp.attrs['Northernmost Latitude'],
-                self.fp.attrs['Southernmost Latitude'],
-                self.fp.attrs['Number of Lines']+1)
-            lat = (lat_bnds[:-1] + lat_bnds[1:])/2.
-            lon_bnds = np.linspace(
-                self.fp.attrs['Westernmost Longitude'],
-                self.fp.attrs['Easternmost Longitude'],
-                self.fp.attrs['Number of Columns']+1)
-            lon = (lon_bnds[:-1] + lon_bnds[1:])/2.
-            dims = lat, lon
+
+def get_axes(attrs):
+    """Return lat and lon axes."""
+    lat_bnds = np.linspace(
+        attrs['Northernmost Latitude'],
+        attrs['Southernmost Latitude'],
+        attrs['Number of Lines']+1)
+    lat = (lat_bnds[:-1] + lat_bnds[1:])/2.
+    lon_bnds = np.linspace(
+        attrs['Westernmost Longitude'],
+        attrs['Easternmost Longitude'],
+        attrs['Number of Columns']+1)
+    lon = (lon_bnds[:-1] + lon_bnds[1:])/2.
+
+    return lat, lon
+
+
+def build_dataset(target, group):
+    """Recursively build a dataset, mapping groups to structures."""
+    for name in group:
+        if isinstance(group[name], h5py.Group):
+            target[name] = StructureType(name)
+            build_dataset(target[name], group[name])
         else:
-            dims = None
-
-        for name in self.fp:
-            if dims and self.fp[name].shape == (len(lat), len(lon)):
-                g = self.dataset[name] = GridType(name, dict(self.fp[name].attrs))
-                g[name] = BaseType(name, self.fp[name], ('lat', 'lon'),
-                    dict(self.fp[name].attrs))
-                g['lat'] = BaseType('lat', dims[0], None,
+            # add extra dimensions if possible
+            if group.attrs.get("Map Projection") == "Equidistant Cylindrical":
+                lat, lon = get_axes(group.attrs)
+                g = target[name] = GridType(name, dict(group[name].attrs))
+                g[name] = BaseType(
+                    name, group[name], ('lat', 'lon'), dict(group[name].attrs))
+                g['lat'] = target['lat'] = BaseType(
+                    'lat', lat, None,
                     dict(axis='Y', units='degrees_north'))
-                g['lon'] = BaseType('lon', dims[1], None,
-                    dict(axis='X', units='degrees_east'))
+                g['lon'] = target['lon'] = BaseType(
+                    'lon', lon, None, dict(axis='X', units='degrees_east'))
             else:
-                self.dataset[name] = BaseType(name, self.fp[name], None,
-                    dict(self.fp[name].attrs))
-
-        if dims:
-            self.dataset['lat'] = g['lat']
-            self.dataset['lon'] = g['lon']
+                target[name] = BaseType(
+                    name, group[name], None, dict(group[name].attrs))
 
 
 if __name__ == "__main__":
